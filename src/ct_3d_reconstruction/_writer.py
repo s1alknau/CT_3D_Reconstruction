@@ -1,7 +1,8 @@
 import os
+
+import h5py
 import numpy as np
 import tifffile
-import h5py
 from napari.utils.notifications import show_info
 
 
