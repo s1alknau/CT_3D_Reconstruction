@@ -1,73 +1,117 @@
-"""
-This module is an example of a barebones numpy reader plugin for napari.
+import os
 
-It implements the Reader specification, but your plugin may choose to
-implement multiple readers or even other plugin contributions. see:
-https://napari.org/stable/plugins/building_a_plugin/guides.html#readers
-"""
-
+import h5py
 import numpy as np
+from napari.utils.notifications import show_info
+from tifffile import TiffFile
 
 
 def napari_get_reader(path):
     """A basic implementation of a Reader contribution.
 
-    Parameters
-    ----------
-    path : str or list of str
-        Path to file, or list of paths.
-
-    Returns
-    -------
-    function or None
-        If the path is a recognized format, return a function that accepts the
-        same path or list of paths, and returns a list of layer data tuples.
+    This reader supports TIFF and HDF5 files, checks that the data is 3D,
+    and transposes the data if the stack dimension is last.
     """
+    # If a list of paths is provided, use the first one.
     if isinstance(path, list):
-        # reader plugins may be handed single path, or a list of paths.
-        # if it is a list, it is assumed to be an image stack...
-        # so we are only going to look at the first file.
         path = path[0]
 
-    # if we know we cannot read the file, we immediately return None.
-    if not path.endswith(".npy"):
-        return None
+    if path.lower().endswith((".tiff", ".tif", ".h5", ".hdf5")):
+        return reader_function
 
-    # otherwise we return the *function* that can read ``path``.
-    return reader_function
+    return None
 
 
 def reader_function(path):
-    """Take a path or list of paths and return a list of LayerData tuples.
+    """Take a path (or list of paths) and return a list of LayerData tuples.
 
-    Readers are expected to return data as a list of tuples, where each tuple
-    is (data, [add_kwargs, [layer_type]]), "add_kwargs" and "layer_type" are
-    both optional.
-
-    Parameters
-    ----------
-    path : str or list of str
-        Path to file, or list of paths.
+    This function checks if the file contains 3D data.
+    For TIFF files, it uses TiffFile to stack multiple pages.
+    If the data is in shape (height, width, slices) with a small number
+    of slices, it transposes to (slices, height, width) (i.e. "ZYX" order).
 
     Returns
     -------
-    layer_data : list of tuples
-        A list of LayerData tuples where each tuple in the list contains
-        (data, metadata, layer_type), where data is a numpy array, metadata is
-        a dict of keyword arguments for the corresponding viewer.add_* method
-        in napari, and layer_type is a lower-case string naming the type of
-        layer. Both "meta", and "layer_type" are optional. napari will
-        default to layer_type=="image" if not provided
+    list
+        A list containing a single tuple: (data, add_kwargs, layer_type)
     """
-    # handle both a string and a list of strings
-    paths = [path] if isinstance(path, str) else path
-    # load all files into array
-    arrays = [np.load(_path) for _path in paths]
-    # stack arrays into single array
-    data = np.squeeze(np.stack(arrays))
+    data = None
+    metadata = {}
 
-    # optional kwargs for the corresponding viewer.add_* method
-    add_kwargs = {}
+    if path.lower().endswith((".tiff", ".tif")):
+        # Use TiffFile to read all pages.
+        with TiffFile(path) as tif:
+            n_pages = len(tif.pages)
+            if n_pages > 1:
+                data = np.stack(
+                    [page.asarray() for page in tif.pages], axis=-1
+                )
+            else:
+                data = tif.asarray()
 
-    layer_type = "image"  # optional, default is "image"
+        # Check if the data is 3D.
+        if data.ndim < 3:
+            show_info(
+                "The TIFF file appears to be 2D. A 3D rotation stack is required for CT reconstruction."
+            )
+            raise ValueError("Data must be 3D for CT reconstruction")
+
+        # If the number of slices (last dimension) is smaller than the height,
+        # assume the stack is stored in (height, width, slices), and transpose to (slices, height, width).
+        if data.shape[-1] < data.shape[0]:
+            data = np.transpose(data, (2, 0, 1))
+
+        layer_type = "image"
+        metadata["axes"] = "ZYX"
+
+    elif path.lower().endswith((".h5", ".hdf5")):
+        with h5py.File(path, "r") as f:
+            dataset_names = list(f.keys())
+            if len(dataset_names) == 0:
+                raise ValueError("HDF5 file does not contain any datasets.")
+
+            # Look for common dataset names.
+            for name in [
+                "recon_vol_lsfm",
+                "volume",
+                "frames",
+                "data",
+                "stack",
+            ]:
+                if name in dataset_names:
+                    data = np.array(f[name])
+                    metadata = dict(f[name].attrs)
+                    break
+
+            if data is None:
+                # Fallback to the first dataset.
+                data = np.array(f[dataset_names[0]])
+                metadata = dict(f[dataset_names[0]].attrs)
+                show_info(f"Loaded dataset: {dataset_names[0]}")
+
+        if data.ndim < 3:
+            show_info(
+                "The HDF5 dataset is 2D. A 3D rotation stack is required for CT reconstruction."
+            )
+            raise ValueError("Loaded HDF5 dataset must be 3D")
+
+        # If the dataset shape seems to be (height, width, slices), transpose it.
+        if data.shape[-1] < data.shape[0]:
+            data = np.transpose(data, (2, 0, 1))
+
+        layer_type = "image"
+        # Set a default for axes if not present.
+        if "axes" not in metadata:
+            metadata["axes"] = "ZYX"
+    else:
+        raise ValueError(
+            "Unsupported file type. Please use .tiff, .tif, .h5, or .hdf5 files."
+        )
+
+    add_kwargs = {"name": os.path.basename(path)}
+    if "spacing" in metadata:
+        add_kwargs["scale"] = metadata["spacing"]
+    if "axes" in metadata:
+        add_kwargs["metadata"] = {"axes": metadata["axes"]}
+
     return [(data, add_kwargs, layer_type)]

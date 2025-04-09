@@ -1,50 +1,23 @@
-name: ct-3d-reconstruction
+name: ct_3d_reconstruction
 display_name: CT 3D Reconstruction
-# use 'hidden' to remove plugin from napari hub search results
-visibility: public
-# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
-categories: ["Annotation", "Segmentation", "Acquisition"]
 contributions:
   commands:
-    - id: ct-3d-reconstruction.get_reader
+    - id: ct_3d_reconstruction.napari_experimental_provide_dock_widget
+      python_name: ct_3d_reconstruction._widget:napari_experimental_provide_dock_widget
+      title: CT 3D Reconstruction Widget
+    - id: ct_3d_reconstruction.napari_get_reader
       python_name: ct_3d_reconstruction._reader:napari_get_reader
-      title: Open data with CT 3D Reconstruction
-    - id: ct-3d-reconstruction.write_multiple
-      python_name: ct_3d_reconstruction._writer:write_multiple
-      title: Save multi-layer data with CT 3D Reconstruction
-    - id: ct-3d-reconstruction.write_single_image
-      python_name: ct_3d_reconstruction._writer:write_single_image
-      title: Save image data with CT 3D Reconstruction
-    - id: ct-3d-reconstruction.make_container_widget
-      python_name: ct_3d_reconstruction:ImageThreshold
-      title: Make threshold Container widget
-    - id: ct-3d-reconstruction.make_magic_widget
-      python_name: ct_3d_reconstruction:threshold_magic_widget
-      title: Make threshold magic widget
-    - id: ct-3d-reconstruction.make_function_widget
-      python_name: ct_3d_reconstruction:threshold_autogenerate_widget
-      title: Make threshold function widget
-    - id: ct-3d-reconstruction.make_qwidget
-      python_name: ct_3d_reconstruction:ExampleQWidget
-      title: Make example QWidget
-  readers:
-    - command: ct-3d-reconstruction.get_reader
-      accepts_directories: false
-      filename_patterns: ['*.npy']
-  writers:
-    - command: ct-3d-reconstruction.write_multiple
-      layer_types: ['image*','labels*']
-      filename_extensions: []
-    - command: ct-3d-reconstruction.write_single_image
-      layer_types: ['image']
-      filename_extensions: ['.npy']
+      title: CT 3D Reader
+    - id: ct_3d_reconstruction.napari_write_image
+      python_name: ct_3d_reconstruction._writer:napari_write_image
+      title: CT 3D Writer
   widgets:
-    - command: ct-3d-reconstruction.make_container_widget
-      display_name: Container Threshold
-    - command: ct-3d-reconstruction.make_magic_widget
-      display_name: Magic Threshold
-    - command: ct-3d-reconstruction.make_function_widget
-      autogenerate: true
-      display_name: Autogenerate Threshold
-    - command: ct-3d-reconstruction.make_qwidget
-      display_name: Example QWidget
+    - command: ct_3d_reconstruction.napari_experimental_provide_dock_widget
+      display_name: CT 3D Reconstruction Widget
+  readers:
+    - command: ct_3d_reconstruction.napari_get_reader
+      filename_patterns: ["*.tiff", "*.tif", "*.h5", "*.hdf5"]
+  writers:
+    - command: ct_3d_reconstruction.napari_write_image
+      layer_types: ["image"]
+      filename_extensions: [".tif", ".tiff", ".h5", ".hdf5"]

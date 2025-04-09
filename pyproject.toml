@@ -1,13 +1,23 @@
 [project]
-name = "ct-3d-reconstruction"
-dynamic = ["version"]
+name = "ct_3d_reconstruction"
+version = "0.1.0"
 description = "A simple plugin for capturing CT image slices and 3D reconstruction"
 readme = "README.md"
-license = {file = "LICENSE"}
-authors = [
-  {name = "s1alknau"},
-  {email = "akknauss@gmail.com"},
+license = { file = "LICENSE" }
+authors = [{ name = "s1alknau", email = "akknauss@gmail.com" }]
+requires-python = ">=3.9"
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "tifffile",
+    "h5py",
+    "magicgui",
+    "qtpy",
+    "napari",
+    "scikit-image",
 ]
+
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: napari",
@@ -23,21 +33,13 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-requires-python = ">=3.9"
-dependencies = [
-    "numpy",
-    "magicgui",
-    "qtpy",
-    "scikit-image",
-]
 
 [project.optional-dependencies]
 testing = [
     "tox",
-    "pytest",  # https://docs.pytest.org/en/latest/contents.html
-    "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
-    "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
-    "napari",
+    "pytest",
+    "pytest-cov",
+    "pytest-qt",
     "pyqt5",
 ]
 
@@ -51,7 +53,7 @@ ct-3d-reconstruction = "ct_3d_reconstruction:napari.yaml"
 "User Support" = "https://github.com/s1alknau/ct-3d-reconstruction/issues"
 
 [build-system]
-requires = ["setuptools>=42.0.0", "wheel"]
+requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -63,35 +65,32 @@ where = ["src"]
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
 
-
-[tool.setuptools.dynamic]
-version = {attr = "ct_3d_reconstruction.__init__.__version__"}
-
 [tool.black]
 line-length = 79
-target-version = ['py310', 'py311', 'py312', 'py313']
+target-version = ["py39", "py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 79
-lint.select = [
-    "E", "F", "W", #flake8
-    "UP", # pyupgrade
-    "I", # isort
-    "BLE", # flake8-blind-exception
-    "B", # flake8-bugbear
-    "A", # flake8-builtins
-    "C4", # flake8-comprehensions
-    "ISC", # flake8-implicit-str-concat
-    "G", # flake8-logging-format
-    "PIE", # flake8-pie
-    "SIM", # flake8-simplify
+target-version = "py39"
+fix = true
+select = [
+    "E", "F", "W",
+    "UP",
+    "I",
+    "BLE",
+    "B",
+    "A",
+    "C4",
+    "ISC",
+    "G",
+    "PIE",
+    "SIM",
 ]
-lint.ignore = [
-    "E501", # line too long. let black handle this
-    "UP006", "UP007", # type annotation. As using magicgui require runtime type annotation then we disable this.
-    "SIM117", # flake8-simplify - some of merged with statements are not looking great with black, reanble after drop python 3.9
+ignore = [
+    "E501",
+    "UP006", "UP007",
+    "SIM117",
 ]
-
 exclude = [
     ".bzr",
     ".direnv",
@@ -113,6 +112,3 @@ exclude = [
     "*vendored*",
     "*_vendor*",
 ]
-
-target-version = "py310"
-fix = true

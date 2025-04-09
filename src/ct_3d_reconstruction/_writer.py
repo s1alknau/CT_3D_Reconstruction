@@ -1,66 +1,108 @@
-"""
-This module is an example of a barebones writer plugin for napari.
-
-It implements the Writer specification.
-see: https://napari.org/stable/plugins/building_a_plugin/guides.html#writers
-
-Replace code below according to your needs.
-"""
-
-from __future__ import annotations
-
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Union
-
-if TYPE_CHECKING:
-    DataType = Union[Any, Sequence[Any]]
-    FullLayerData = tuple[DataType, dict, str]
+import os
+import numpy as np
+import tifffile
+import h5py
+from napari.utils.notifications import show_info
 
 
-def write_single_image(path: str, data: Any, meta: dict) -> list[str]:
-    """Writes a single image layer.
+class LSFMVolumeWriter:
+    def __init__(self):
+        pass
+
+    def write_tiff(self, volume, path, metadata=None):
+        """Save volume as a TIFF file."""
+        try:
+            # Ensure the path has the proper extension
+            if not path.lower().endswith((".tif", ".tiff")):
+                path = f"{path}.tif"
+            tifffile.imwrite(
+                path,
+                np.float32(volume),
+                imagej=True,
+                metadata=metadata or {"axes": "ZYX"},
+            )
+            show_info(f"Volume successfully saved as TIFF at: {path}")
+            return path
+        except OSError as e:  # noqa: BLE001
+            show_info(f"Error saving TIFF: {e}")
+            raise e
+
+    def write_hdf5(self, volume, path, meta=None):
+        """Save volume as an HDF5 file."""
+        try:
+            # Ensure the path has the proper extension
+            if not path.lower().endswith((".h5", ".hdf5")):
+                path = f"{path}.h5"
+            with h5py.File(path, "w") as f:
+                dset = f.create_dataset(
+                    "reconstructed_volume",
+                    data=np.float32(volume),
+                    compression="gzip",
+                )
+                if meta:
+                    for key, value in meta.items():
+                        dset.attrs[key] = value
+            show_info(f"Volume successfully saved as HDF5 at: {path}")
+            return path
+        except OSError as e:  # noqa: BLE001
+            show_info(f"Error saving HDF5: {e}")
+            raise e
+
+
+def napari_write_image(path, data, meta):
+    """Helper function to write image data using LSFMVolumeWriter."""
+    writer = LSFMVolumeWriter()
+    try:
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if ext in ("tif", "tiff"):
+            return writer.write_tiff(data, path, metadata=meta)
+        elif ext in ("h5", "hdf5"):
+            return writer.write_hdf5(data, path, meta=meta)
+        else:
+            show_info(f"Unrecognized extension: {ext}. Saving as TIFF.")
+            return writer.write_tiff(data, path + ".tif", metadata=meta)
+    except Exception as e:  # noqa: BLE001
+        show_info(f"Error in napari_write_image: {str(e)}")
+        return None
+
+
+def napari_get_writer(path, layer_types):
+    """Return a function capable of writing napari layer data to a path.
 
     Parameters
     ----------
     path : str
-        A string path indicating where to save the image file.
-    data : The layer data
-        The `.data` attribute from the napari layer.
-    meta : dict
-        A dictionary containing all other attributes from the napari layer
-        (excluding the `.data` layer attribute).
+        The file path to write to.
+    layer_types : list of str
+        The list of layer types (all should be "image").
 
     Returns
     -------
-    [path] : A list containing the string path to the saved file.
+    callable or None
+        A function that accepts a path and a list of layer data tuples.
     """
+    if not all(lt == "image" for lt in layer_types):
+        return None
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    if ext not in ("tif", "tiff", "h5", "hdf5"):
+        return None
 
-    # implement your writer logic here ...
+    def writer_function(path, layer_data):
+        """Write multiple layers to the specified path."""
+        paths = []
+        for data, meta, _ in layer_data:
+            try:
+                # If writing multiple layers, append a unique name if available.
+                if len(layer_data) > 1 and "name" in meta:
+                    basename, ext = os.path.splitext(path)
+                    new_path = f"{basename}_{meta['name']}{ext}"
+                else:
+                    new_path = path
+                written_path = napari_write_image(new_path, data, meta)
+                if written_path:
+                    paths.append(written_path)
+            except Exception as e:  # noqa: BLE001
+                show_info(f"Error writing layer: {str(e)}")
+        return paths
 
-    # return path to any file(s) that were successfully written
-    return [path]
-
-
-def write_multiple(path: str, data: list[FullLayerData]) -> list[str]:
-    """Writes multiple layers of different types.
-
-    Parameters
-    ----------
-    path : str
-        A string path indicating where to save the data file(s).
-    data : A list of layer tuples.
-        Tuples contain three elements: (data, meta, layer_type)
-        `data` is the layer data
-        `meta` is a dictionary containing all other metadata attributes
-        from the napari layer (excluding the `.data` layer attribute).
-        `layer_type` is a string, eg: "image", "labels", "surface", etc.
-
-    Returns
-    -------
-    [path] : A list containing (potentially multiple) string paths to the saved file(s).
-    """
-
-    # implement your writer logic here ...
-
-    # return path to any file(s) that were successfully written
-    return [path]
+    return writer_function
