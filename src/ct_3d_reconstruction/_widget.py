@@ -1,28 +1,27 @@
 # widget.py
-import os
+import concurrent.futures
+
+import napari
 import numpy as np
 import scipy.ndimage as ndi
-from skimage.transform import iradon
-import napari
-from napari.utils.notifications import show_info
 from napari.layers import Image
-
+from napari.utils.notifications import show_info
+from napari_plugin_engine import napari_hook_implementation
 from qtpy.QtCore import Signal, Slot
 from qtpy.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
-    QComboBox,
-    QPushButton,
+    QHBoxLayout,
     QProgressBar,
-    QDoubleSpinBox,
-    QCheckBox,
-    QFileDialog,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
-from napari_plugin_engine import napari_hook_implementation
-import concurrent.futures
+from skimage.transform import iradon
 
 from ._reader import napari_get_reader
 from ._writer import LSFMVolumeWriter
@@ -309,7 +308,7 @@ class LSFMReconstructionWidget(QWidget):
 
     def _start(self):
         nm = self.layer_cb.currentText()
-        lyr = next((l for l in self.viewer.layers if l.name == nm), None)
+        lyr = next((layer for layer in self.viewer.layers if layer.name == nm), None)
         if lyr is None:
             show_info("Select a rotation stack")
             return
@@ -386,9 +385,7 @@ class LSFMReconstructionWidget(QWidget):
         if not path:
             return
         fmt = "tiff" if filt.startswith("TIF") else "h5"
-        vol = next(
-            l for l in self.viewer.layers if l.name == "Reconstructed Volume"
-        ).data
+        vol = next(layer for layer in self.viewer.layers if layer.name == "Reconstructed Volume").data
         self.worker.save_volume(
             vol,
             path,
