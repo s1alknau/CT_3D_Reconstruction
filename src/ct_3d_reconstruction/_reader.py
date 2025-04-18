@@ -43,9 +43,7 @@ def reader_function(path):
         with TiffFile(path) as tif:
             n_pages = len(tif.pages)
             if n_pages > 1:
-                data = np.stack(
-                    [page.asarray() for page in tif.pages], axis=-1
-                )
+                data = np.stack([page.asarray() for page in tif.pages], axis=-1)
             else:
                 data = tif.asarray()
 

@@ -1,78 +1,54 @@
-import concurrent.futures
+# widget.py
 import os
-
-import napari
 import numpy as np
-import scipy.ndimage
-from napari.layers import Image
+import scipy.ndimage as ndi
+from skimage.transform import iradon
+import napari
 from napari.utils.notifications import show_info
+from napari.layers import Image
 
-# Import the hook decorator from napari_plugin_engine (npe2)
-from napari_plugin_engine import napari_hook_implementation
 from qtpy.QtCore import Signal, Slot
 from qtpy.QtWidgets import (
-    QComboBox,
-    QDoubleSpinBox,
-    QFileDialog,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
-    QProgressBar,
+    QComboBox,
     QPushButton,
-    QSpinBox,
-    QVBoxLayout,
-    QWidget,
+    QProgressBar,
+    QDoubleSpinBox,
+    QCheckBox,
+    QFileDialog,
 )
+from napari_plugin_engine import napari_hook_implementation
+import concurrent.futures
 
 from ._reader import napari_get_reader
 from ._writer import LSFMVolumeWriter
 
 
-# --------------------------
-# Helper function for parallel processing.
-# Processes one projection:
-#  - Extract a slice from the input data (assumed shape: (num_slices, height, width))
-#  - Downscale the slice using the provided downsample factor.
-#  - Crop the downscaled slice to exactly (new_height, new_width)
-#  - Insert the slice into a temporary volume at the computed center slice.
-#  - Rotate that temporary volume by the computed angle.
-#  - Build a corresponding normalization mask.
-# --------------------------
-def process_slice(args):
-    (i, angle, data, angle_step, center_slice, out_shape, ds) = args
-    # Determine the slice index.
-    idx = min(i * angle_step, data.shape[0] - 1)
-    slice_img = data[idx, :, :]
-    # Downscale using scipy.ndimage.zoom (bilinear interpolation, order=1).
-    slice_img_ds = scipy.ndimage.zoom(slice_img, zoom=(ds, ds), order=1)
-    # Force the downscaled slice to have exactly the expected dimensions.
-    new_height, new_width, _ = out_shape
-    slice_img_ds = slice_img_ds[:new_height, :new_width]
-
-    # Allocate a temporary volume and insert the slice into the computed center.
-    vol_tmp = np.zeros(out_shape, dtype=np.float32)
-    vol_tmp[:, :, center_slice] = slice_img_ds
-
-    # Rotate the temporary volume by the computed angle.
-    vol_tmp = scipy.ndimage.rotate(
-        vol_tmp, angle, mode="nearest", axes=(0, 2), reshape=False
-    )
-
-    # Create the corresponding normalization volume.
-    norm_tmp = np.zeros(out_shape, dtype=np.float32)
-    norm_tmp[:, :, center_slice] = np.ones(
-        (new_height, new_width), dtype=np.float32
-    )
-    norm_tmp = scipy.ndimage.rotate(
-        norm_tmp, angle, mode="nearest", axes=(0, 2), reshape=False
-    )
-
-    return vol_tmp, norm_tmp
+def _estimate_center(sino_2d, max_fraction=0.25):
+    """
+    Estimate horizontal center shift by minimizing left-right asymmetry.
+    """
+    sino_1d = np.mean(sino_2d, axis=0)
+    w = sino_1d.size
+    mid = w // 2
+    max_shift = int(w * max_fraction)
+    best_shift = 0
+    best_err = np.inf
+    for shift in range(-max_shift, max_shift + 1):
+        rolled = np.roll(sino_1d, shift)
+        left = rolled[:mid]
+        right = rolled[-mid:][::-1]
+        err = np.sum(np.abs(left - right))
+        if err < best_err:
+            best_err = err
+            best_shift = shift
+    return best_shift
 
 
-# --------------------------
-# Worker class that performs CT reconstruction using parallel processing.
-# --------------------------
 class ReconstructionWorker(QWidget):
     progress_updated = Signal(int)
     reconstruction_complete = Signal(object)
@@ -82,297 +58,345 @@ class ReconstructionWorker(QWidget):
         self.writer = LSFMVolumeWriter()
 
     def reconstruct_volume(
-        self, data, angle_step=1, center_offset=0, downsample=1.0
+        self,
+        data,
+        angle_step,
+        downsample,
+        center_offset,
+        auto_center,
+        filter_name,
+        circle,
+        log_normalize,
+        pre_filter,
+        post_filter,
+        window_level,
+        ring_remove,
+        angle_averaging=1,  # New parameter for angle averaging
+        stronger_post_filter=False,  # New parameter for stronger post-filtering
     ):
-        """
-        Reconstruct a 3D volume from a rotation stack using parallel processing and downsampling.
+        # data: (n_proj, H, W)
+        n_proj, h_orig, w_orig = data.shape
 
-        Parameters
-        ----------
-        data : numpy.ndarray
-            3D rotation stack in ZYX order (shape: (num_slices, height, width)).
-        angle_step : int or float
-            Process every 'angle_step'-th slice; also used as the per-slice angle increment.
-        center_offset : int
-            Offset (in pixels) for the center slice (on the downscaled dimensions).
-        downsample : float, optional
-            Factor to downscale the images (from 0.1 to 1.0; default 1.0 means full resolution).
+        # 1) optional log‐normalize
+        if log_normalize:
+            p = data.astype(np.float32) + 1e-6
+            data = -np.log(p / np.max(p))
 
-        Returns
-        -------
-        numpy.ndarray
-            The reconstructed 3D volume.
-        """
-        num_slices, height, width = data.shape
+        # 2) downsample Y/X
+        data_f = data.astype(np.float32)
+        if downsample != 1.0:
+            data_ds = ndi.zoom(data_f, (1, downsample, downsample), order=1)
+        else:
+            data_ds = data_f
+        _, h_ds, w_ds = data_ds.shape
 
-        ds = downsample
-        new_height = int(height * ds)
-        new_width = int(width * ds)
-        # The current algorithm produces a volume with shape (new_height, new_width, new_height).
-        out_shape = (new_height, new_width, new_height)
+        # 3) angles array
+        theta = np.arange(n_proj) * angle_step
 
-        # Compute the center slice of the output volume.
-        center_slice = new_height // 2 + int(center_offset * ds)
+        # 4) auto-center sinograms
+        if auto_center:
+            sino_avg = np.mean(data_ds, axis=1)
+            best = _estimate_center(sino_avg)
+            center_offset = best
+            show_info(f"Auto-center shift = {best} px")
 
-        # Initialize accumulator arrays.
-        myvolume = np.zeros(out_shape, dtype=np.float32)
-        myvolume_norm = np.zeros(out_shape, dtype=np.float32)
+        # 5) allocate reconstruction buffer [Y, X, X]
+        recon = np.zeros((h_ds, w_ds, w_ds), dtype=np.float32)
 
-        # Select every 'angle_step'-th slice.
-        indices = list(range(0, num_slices, int(angle_step)))
-        total_tasks = len(indices)
-        tasks = [
-            (
-                i,
-                indices[i] * angle_step,
-                data,
-                angle_step,
-                center_slice,
-                out_shape,
-                ds,
-            )
-            for i in range(total_tasks)
-        ]
+        def _reconstruct_row(y):
+            sino = data_ds[:, y, :]
 
-        # Process tasks in parallel.
+            # ring artifact removal (subtract column median)
+            if ring_remove:
+                sino = sino - np.median(sino, axis=0)[None, :]
+
+            # Apply angle averaging if enabled (reduces noise by averaging neighboring projections)
+            if angle_averaging > 1:
+                sino_avg = np.zeros_like(sino)
+                for i in range(sino.shape[0]):
+                    # Calculate indices for averaging window, handling wrap-around
+                    avg_indices = [
+                        (i + j) % sino.shape[0]
+                        for j in range(
+                            -angle_averaging // 2 + 1, angle_averaging // 2 + 1
+                        )
+                    ]
+                    # Average the projections
+                    sino_avg[i] = np.mean(sino[avg_indices], axis=0)
+                sino = sino_avg
+
+            # pre-filter sinogram
+            if pre_filter:
+                # Use larger kernel for stronger noise reduction
+                sino = ndi.median_filter(sino, size=(1, 5))
+
+            # apply center offset
+            if center_offset:
+                sino = np.roll(sino, int(center_offset), axis=1)
+
+            # transpose for iradon: (detector, angles)
+            sino = sino.T
+
+            # FBP reconstruction
+            rec = iradon(
+                sino,
+                theta=theta,
+                filter_name=filter_name,
+                circle=circle,
+                output_size=w_ds,
+            ).astype(np.float32)
+            return y, rec
+
+        # 6) parallel back-projection
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            results = list(executor.map(process_slice, tasks))
+            for y, rec in executor.map(_reconstruct_row, range(h_ds)):
+                recon[y] = rec
+                pct = int((y + 1) / h_ds * 100)
+                self.progress_updated.emit(pct)
 
-        # Accumulate the results.
-        for i, (vol_tmp, norm_tmp) in enumerate(results):
-            myvolume += vol_tmp
-            myvolume_norm += norm_tmp
-            progress = int(((i + 1) / total_tasks) * 100)
-            self.progress_updated.emit(progress)
+        # 7) reorder to (Z, Y, X)
+        vol = recon.transpose(2, 0, 1)
 
-        # Avoid division by zero.
-        myvolume_norm[myvolume_norm == 0] = 1
+        # 8) post‐filter volume
+        if post_filter:
+            if stronger_post_filter:
+                # Apply stronger 3D filtering
+                vol = ndi.median_filter(vol, size=(5, 5, 5))
+                # Additional Gaussian smoothing to reduce noise
+                vol = ndi.gaussian_filter(vol, sigma=1.0)
+            else:
+                vol = ndi.median_filter(vol, size=(3, 3, 3))
 
-        # Normalize the volume to a [0, 1] range.
-        recon_vol = myvolume / myvolume_norm
-        recon_vol -= np.min(recon_vol)
-        if np.max(recon_vol) > 0:
-            recon_vol /= np.max(recon_vol)
+        # 9) window‐level normalization
+        if window_level:
+            p1, p99 = np.percentile(vol, (1, 99))
+            vol = np.clip(vol, p1, p99)
+            vol = (vol - p1) / (p99 - p1)
 
         self.progress_updated.emit(100)
-        self.reconstruction_complete.emit(recon_vol)
-        return recon_vol
+        self.reconstruction_complete.emit(vol)
+        return vol
 
     def save_volume(self, volume, path, format_name, meta=None):
         try:
-            if format_name.lower() in ["tif", "tiff"]:
+            if format_name.lower() in ("tif", "tiff"):
                 self.writer.write_tiff(volume, path, metadata=meta)
-            elif format_name.lower() in ["h5", "hdf5"]:
-                self.writer.write_hdf5(volume, path, meta=meta)
             else:
-                show_info(
-                    f"Unsupported format: {format_name}. Saving as TIFF."
-                )
-                self.writer.write_tiff(volume, path, metadata=meta)
-            show_info(f"Volume successfully saved to {path}")
-        except Exception as e:  # noqa: BLE001
-            show_info(f"Error saving volume: {str(e)}")
+                self.writer.write_hdf5(volume, path, meta=meta)
+            show_info(f"Volume saved to {path}")
+        except Exception as e:
+            show_info(f"Error saving: {e}")
 
 
-# --------------------------
-# Main widget class for the CT 3D Reconstruction plugin.
-# --------------------------
 class LSFMReconstructionWidget(QWidget):
-    def __init__(self, napari_viewer):
+    def __init__(self, napari_viewer=None):
         super().__init__()
-        self.viewer = napari_viewer
-        self.reconstructed_volume = None
+        self.viewer = napari_viewer or napari.current_viewer()
         self.worker = ReconstructionWorker()
+        self.worker.progress_updated.connect(self._on_progress)
+        self.worker.reconstruction_complete.connect(self._on_complete)
+        self._build_ui()
 
-        self.worker.progress_updated.connect(self.update_progress)
-        self.worker.reconstruction_complete.connect(
-            self.on_reconstruction_complete
-        )
-
-        self.setup_ui()
-
-    def setup_ui(self):
+    def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        # Load file section.
-        load_group = QGroupBox("Load Data")
-        load_layout = QVBoxLayout(load_group)
-        load_button = QPushButton("Load CT File")
-        load_button.clicked.connect(self.load_file)
-        load_layout.addWidget(load_button)
-        layout.addWidget(load_group)
+        # --- Load Data ---
+        load_g = QGroupBox("Load Data")
+        load_l = QVBoxLayout(load_g)
+        btn = QPushButton("Load CT File")
+        btn.clicked.connect(self._load)
+        load_l.addWidget(btn)
+        layout.addWidget(load_g)
 
-        # Input selection section.
-        input_group = QGroupBox("Input Data")
-        input_layout = QFormLayout(input_group)
-        self.layer_combo = QComboBox()
-        self.update_layer_list()
-        self.viewer.layers.events.inserted.connect(self.update_layer_list)
-        self.viewer.layers.events.removed.connect(self.update_layer_list)
-        input_layout.addRow("Rotation Stack:", self.layer_combo)
-        layout.addWidget(input_group)
+        # --- Input Data ---
+        in_g = QGroupBox("Input Data")
+        in_f = QFormLayout(in_g)
+        self.layer_cb = QComboBox()
+        self._refresh_layers()
+        self.viewer.layers.events.inserted.connect(self._refresh_layers)
+        self.viewer.layers.events.removed.connect(self._refresh_layers)
+        in_f.addRow("Rotation Stack:", self.layer_cb)
+        layout.addWidget(in_g)
 
-        # Reconstruction parameters section.
-        param_group = QGroupBox("Reconstruction Parameters")
-        param_layout = QFormLayout(param_group)
-        self.angle_step = QSpinBox()
-        self.angle_step.setRange(1, 180)
-        self.angle_step.setValue(1)
-        param_layout.addRow("Angle Step (°):", self.angle_step)
-        self.center_offset = QSpinBox()
-        self.center_offset.setRange(-100, 100)
-        self.center_offset.setValue(0)
-        param_layout.addRow("Center Offset (pixels):", self.center_offset)
-        self.voxel_size = QDoubleSpinBox()
-        self.voxel_size.setRange(0.01, 100.0)
-        self.voxel_size.setValue(1.0)
-        self.voxel_size.setSuffix(" µm")
-        self.voxel_size.setDecimals(2)
-        param_layout.addRow("Voxel Size:", self.voxel_size)
-        self.downsample_factor = QDoubleSpinBox()
-        self.downsample_factor.setRange(0.1, 1.0)
-        self.downsample_factor.setValue(1.0)
-        self.downsample_factor.setSingleStep(0.1)
-        self.downsample_factor.setDecimals(2)
-        param_layout.addRow("Downsample Factor:", self.downsample_factor)
-        layout.addWidget(param_group)
+        # --- Reconstruction Parameters ---
+        p_g = QGroupBox("Reconstruction Parameters")
+        p_f = QFormLayout(p_g)
+        self.angle_sb = QDoubleSpinBox()
+        self.angle_sb.setRange(0.01, 360)
+        self.angle_sb.setValue(3.6)
+        p_f.addRow("Angle Step (°):", self.angle_sb)
+        self.down_sb = QDoubleSpinBox()
+        self.down_sb.setRange(0.1, 1.0)
+        self.down_sb.setValue(0.5)
+        p_f.addRow("Downsample:", self.down_sb)
+        self.center_sb = QDoubleSpinBox()
+        self.center_sb.setRange(-1e6, 1e6)
+        self.center_sb.setValue(0)
+        p_f.addRow("Center Offset:", self.center_sb)
+        self.auto_center = QCheckBox("Auto-center")
+        p_f.addRow("", self.auto_center)
 
-        # Progress section.
-        progress_group = QGroupBox("Progress")
-        progress_layout = QVBoxLayout(progress_group)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        progress_layout.addWidget(self.progress_bar)
-        layout.addWidget(progress_group)
+        # New angle averaging parameter
+        self.avg_sb = QDoubleSpinBox()
+        self.avg_sb.setRange(1, 9)
+        self.avg_sb.setValue(1)
+        self.avg_sb.setSingleStep(2)
+        p_f.addRow("Angle Averaging:", self.avg_sb)
 
-        # Action buttons.
-        button_layout = QHBoxLayout()
-        self.reconstruct_button = QPushButton("Reconstruct Volume")
-        self.reconstruct_button.clicked.connect(self.start_reconstruction)
-        self.save_button = QPushButton("Save Volume")
-        self.save_button.setEnabled(False)
-        self.save_button.clicked.connect(self.save_reconstructed_volume)
-        button_layout.addWidget(self.reconstruct_button)
-        button_layout.addWidget(self.save_button)
-        layout.addLayout(button_layout)
+        self.filter_cb = QComboBox()
+        for f in ("ramp", "shepp-logan", "cosine", "hamming", "hann"):
+            self.filter_cb.addItem(f)
+        p_f.addRow("Filter:", self.filter_cb)
+        self.circle = QCheckBox("Crop circle")
+        p_f.addRow("", self.circle)
+        self.log_norm = QCheckBox("Log-normalize")
+        p_f.addRow("", self.log_norm)
+        self.ring = QCheckBox("Ring artifact removal")
+        p_f.addRow("", self.ring)
+        self.pre = QCheckBox("Pre-filter sinogram")
+        p_f.addRow("", self.pre)
+        self.post = QCheckBox("Post-filter volume")
+        p_f.addRow("", self.post)
 
-    def load_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select CT File",
-            "",
-            "CT Files (*.tif *.tiff *.h5 *.hdf5);;All Files (*)",
+        # New stronger post-filter option
+        self.strong_post = QCheckBox("Strong post-filter")
+        p_f.addRow("", self.strong_post)
+
+        self.window = QCheckBox("Window-level 1–99%")
+        p_f.addRow("", self.window)
+        self.voxel_sb = QDoubleSpinBox()
+        self.voxel_sb.setRange(0.01, 1000)
+        self.voxel_sb.setValue(1.0)
+        self.voxel_sb.setSuffix(" µm")
+        p_f.addRow("Voxel Size:", self.voxel_sb)
+        layout.addWidget(p_g)
+
+        # --- Progress & Actions ---
+        prog_g = QGroupBox("Progress")
+        prog_l = QVBoxLayout(prog_g)
+        self.pb = QProgressBar()
+        prog_l.addWidget(self.pb)
+        layout.addWidget(prog_g)
+
+        h = QHBoxLayout()
+        self.run_btn = QPushButton("Reconstruct")
+        self.run_btn.clicked.connect(self._start)
+        h.addWidget(self.run_btn)
+        self.save_btn = QPushButton("Save Volume")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self._save)
+        h.addWidget(self.save_btn)
+        layout.addLayout(h)
+
+    def _refresh_layers(self, *a):
+        self.layer_cb.clear()
+        for lyr in self.viewer.layers:
+            if isinstance(lyr, Image) and lyr.data.ndim == 3:
+                self.layer_cb.addItem(lyr.name)
+
+    def _load(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open CT Stack", "", "*.tif *.tiff *.h5 *.hdf5"
         )
-        if not file_path:
-            show_info("No file selected")
+        if not path:
             return
-
-        reader = napari_get_reader(file_path)
+        reader = napari_get_reader(path)
         if reader is None:
-            show_info("File type not supported by the CT reader")
+            show_info("Unsupported file type")
             return
+        for data, kw, _ in reader(path):
+            self.viewer.add_image(data, **kw)
 
-        try:
-            layer_data = reader(file_path)
-            for data, add_kwargs, _ in layer_data:
-                self.viewer.add_image(data, **add_kwargs)
-            show_info(f"Loaded file: {os.path.basename(file_path)}")
-        except Exception as e:  # noqa: BLE001
-            show_info(f"Error loading file: {str(e)}")
-
-    def update_layer_list(self, event=None):
-        self.layer_combo.clear()
-        for layer in self.viewer.layers:
-            if isinstance(layer, Image) and layer.data.ndim >= 3:
-                self.layer_combo.addItem(layer.name)
-        if hasattr(self, "reconstruct_button"):
-            self.reconstruct_button.setEnabled(self.layer_combo.count() > 0)
-
-    def get_selected_layer_data(self):
-        layer_name = self.layer_combo.currentText()
-        for layer in self.viewer.layers:
-            if layer.name == layer_name:
-                return layer.data, layer
-        return None, None
-
-    def start_reconstruction(self):
-        data, _ = self.get_selected_layer_data()
-        if data is None:
-            show_info("Please select a valid rotation stack layer")
+    def _start(self):
+        nm = self.layer_cb.currentText()
+        lyr = next((l for l in self.viewer.layers if l.name == nm), None)
+        if lyr is None:
+            show_info("Select a rotation stack")
             return
-        self.reconstruct_button.setEnabled(False)
-        self.save_button.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.reconstructed_volume = self.worker.reconstruct_volume(
-            data,
-            angle_step=self.angle_step.value(),
-            center_offset=self.center_offset.value(),
-            downsample=self.downsample_factor.value(),
+        self.run_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.pb.setValue(0)
+        self.worker.reconstruct_volume(
+            lyr.data,
+            angle_step=self.angle_sb.value(),
+            downsample=self.down_sb.value(),
+            center_offset=self.center_sb.value(),
+            auto_center=self.auto_center.isChecked(),
+            filter_name=self.filter_cb.currentText(),
+            circle=self.circle.isChecked(),
+            log_normalize=self.log_norm.isChecked(),
+            pre_filter=self.pre.isChecked(),
+            post_filter=self.post.isChecked(),
+            window_level=self.window.isChecked(),
+            ring_remove=self.ring.isChecked(),
+            angle_averaging=int(self.avg_sb.value()),  # New parameter
+            stronger_post_filter=self.strong_post.isChecked(),  # New parameter
         )
 
     @Slot(int)
-    def update_progress(self, value):
-        self.progress_bar.setValue(value)
+    def _on_progress(self, v):
+        self.pb.setValue(v)
 
     @Slot(object)
-    def on_reconstruction_complete(self, volume):
-        self.reconstructed_volume = volume
-        voxel_size = self.voxel_size.value()
-        scale = [voxel_size, voxel_size, voxel_size]
-        self.viewer.add_image(
-            volume,
+    def _on_complete(self, vol):
+        # add reconstructed volume
+        self.viewer.dims.ndisplay = 3
+        layer = self.viewer.add_image(
+            vol,
             name="Reconstructed Volume",
-            scale=scale,
-            colormap="viridis",
+            scale=[self.voxel_sb.value()] * 3,
+            colormap="gist_earth",
         )
-        self.reconstruct_button.setEnabled(True)
-        self.save_button.setEnabled(True)
+        layer.rendering = "mip"
+        layer.interpolation = "linear"
+
+        # Reset view to properly center on the volume
+        self.viewer.reset_view()
+
+        # Make sure the camera is centered on the volume
+        # Get the midpoint of the volume
+        center_z = vol.shape[0] // 2
+        center_y = vol.shape[1] // 2
+        center_x = vol.shape[2] // 2
+
+        # Set the camera center in data coordinates
+        self.viewer.camera.center = (
+            center_z * self.voxel_sb.value(),
+            center_y * self.voxel_sb.value(),
+            center_x * self.voxel_sb.value(),
+        )
+
+        # Adjust the camera zoom to fit the volume nicely
+        max_dim = max(vol.shape)
+        self.viewer.camera.zoom = (
+            0.8 * 512 / max_dim
+        )  # Scale factor for reasonable view
+
+        # Make sure we're in 3D view mode
+        self.viewer.dims.ndisplay = 3
+
+        self.run_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
         show_info("Reconstruction complete!")
 
-    def save_reconstructed_volume(self):
-        if self.reconstructed_volume is None:
-            show_info("No reconstructed volume available")
-            return
-
-        path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Save Reconstructed Volume",
-            "",
-            "TIFF Files (*.tif *.tiff);;HDF5 Files (*.hdf5 *.h5);;All Files (*)",
+    def _save(self):
+        path, filt = QFileDialog.getSaveFileName(
+            self, "Save Volume", "", "TIFF (*.tif *.tiff);;HDF5 (*.h5 *.hdf5)"
         )
-
         if not path:
-            show_info("Save cancelled")
             return
-
-        if not path.lower().endswith((".tif", ".tiff", ".h5", ".hdf5")):
-            if "TIFF" in selected_filter:
-                path += ".tif"
-                format_name = "tiff"
-            elif "HDF5" in selected_filter:
-                path += ".h5"
-                format_name = "h5"
-            else:
-                path += ".tif"
-                format_name = "tiff"
-        else:
-            ext = os.path.splitext(path)[1].lower()
-            format_name = "tiff" if ext in (".tif", ".tiff") else "h5"
-
-        meta = {
-            "spacing": self.voxel_size.value(),
-            "unit": "um",
-            "axes": "ZYX",
-            "description": "Reconstructed from CT rotation stack",
-        }
+        fmt = "tiff" if filt.startswith("TIF") else "h5"
+        vol = next(
+            l for l in self.viewer.layers if l.name == "Reconstructed Volume"
+        ).data
         self.worker.save_volume(
-            self.reconstructed_volume, path, format_name, meta
+            vol,
+            path,
+            fmt,
+            meta={"spacing": self.voxel_sb.value(), "unit": "um", "axes": "ZYX"},
         )
 
 
 @napari_hook_implementation
 def napari_experimental_provide_dock_widget(napari_viewer=None):
-    if napari_viewer is None:
-        napari_viewer = napari.current_viewer()
     return LSFMReconstructionWidget(napari_viewer)
